@@ -114,11 +114,12 @@ class SimpleArbitrageBot:
             )
             self.risk_manager = RiskManager(risk_limits)
         
-        # Try to find current market — auto-detect or use provided slug
+        # Try to find current market — provided slug takes priority, then auto-detect
         try:
             if market_slug:
                 logger.info(f"Using provided market: {market_slug}")
             elif settings.market_slug:
+                # Only use .env if no market_slug was provided to __init__
                 logger.info(f"Using configured market: {settings.market_slug}")
                 market_slug = settings.market_slug
             else:
