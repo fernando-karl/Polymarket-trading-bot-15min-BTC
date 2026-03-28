@@ -17,6 +17,10 @@ class L2BookState:
     asks: dict[float, float] = field(default_factory=dict)  # price -> size
     last_timestamp_ms: Optional[int] = None
     last_hash: Optional[str] = None
+    # Cache de levels para evitar reconstrução desnecessária
+    _dirty: bool = field(default=True, repr=False)
+    _cached_bid_levels: list = field(default_factory=list, repr=False)
+    _cached_ask_levels: list = field(default_factory=list, repr=False)
 
     def apply_snapshot(self, msg: dict[str, Any]) -> None:
         # Docs use bids/asks; some older tables mention buys/sells. Support both.
@@ -53,6 +57,7 @@ class L2BookState:
             except Exception:
                 pass
         self.last_hash = msg.get("hash") or self.last_hash
+        self._dirty = True
 
     def apply_price_changes(self, msg: dict[str, Any]) -> None:
         ts = msg.get("timestamp")
@@ -80,11 +85,26 @@ class L2BookState:
             # hash field refers to the order; keep as last_hash for debugging
             if ch.get("hash"):
                 self.last_hash = ch.get("hash")
+        
+        self._dirty = True
 
     def to_levels(self) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-        bid_levels = sorted(((p, s) for p, s in self.bids.items() if s > 0), key=lambda x: x[0], reverse=True)
-        ask_levels = sorted(((p, s) for p, s in self.asks.items() if s > 0), key=lambda x: x[0])
-        return bid_levels, ask_levels
+        """Retorna levels cacheados se book não mudou."""
+        if not self._dirty:
+            return self._cached_bid_levels, self._cached_ask_levels
+        
+        # Reconstruir apenas quando dirty
+        self._cached_bid_levels = sorted(
+            ((p, s) for p, s in self.bids.items() if s > 0),
+            key=lambda x: x[0],
+            reverse=True
+        )
+        self._cached_ask_levels = sorted(
+            ((p, s) for p, s in self.asks.items() if s > 0),
+            key=lambda x: x[0]
+        )
+        self._dirty = False
+        return self._cached_bid_levels, self._cached_ask_levels
 
 
 class MarketWssClient:

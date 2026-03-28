@@ -343,6 +343,54 @@ def get_positions(settings: Settings, token_ids: list[str] = None) -> dict:
         return {}
 
 
+def warmup_client_cache(settings: Settings, token_ids: list[str]) -> None:
+    """
+    Pré-aquece o cache do cliente CLOB.
+    
+    Chama get_tick_size e get_neg_risk para cada token ANTES
+    de qualquer trade, eliminando HTTP frio no hot path.
+    
+    Deve ser chamado uma vez no startup do bot.
+    """
+    client = get_client(settings)
+    logger.info(f"Pré-aquecendo cache para {len(token_ids)} tokens...")
+    
+    for token_id in token_ids:
+        try:
+            # Força fetch e cacheamento do tick size (TTL 300s)
+            client.get_tick_size(token_id)
+            # Força fetch e cacheamento do neg_risk
+            client.get_neg_risk(token_id)
+            logger.debug(f"Cache quente: {token_id[:16]}...")
+        except Exception as e:
+            logger.warning(f"Warmup falhou para {token_id[:16]}: {e}")
+    
+    logger.info("✅ Cache pré-aquecido — primeira ordem será rápida")
+
+
+def refresh_cache_if_needed(settings: Settings, token_ids: list[str], ttl_s: float = 240.0) -> None:
+    """
+    Refresh proactivo do cache antes de expirar.
+    
+    O TTL do tick_size é 300s. Refrescar aos 240s evita
+    que expire a meio do hot path.
+    
+    Chamar em background a cada 4 minutos.
+    """
+    client = get_client(settings)
+    now = time.monotonic()
+    
+    for token_id in token_ids:
+        cached_at = getattr(client, '_ClobClient__tick_size_timestamps', {}).get(token_id)
+        if cached_at is None or (now - cached_at) > ttl_s:
+            try:
+                client.get_tick_size(token_id)
+                client.get_neg_risk(token_id)
+                logger.debug(f"Cache refreshed: {token_id[:16]}...")
+            except Exception as e:
+                logger.warning(f"Cache refresh falhou: {e}")
+
+
 # Thread pool para operações de IO paralelas
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 

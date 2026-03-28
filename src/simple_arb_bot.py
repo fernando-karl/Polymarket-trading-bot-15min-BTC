@@ -127,6 +127,10 @@ class SimpleArbitrageBot:
         logger.info(f"UP Token (YES): {self.yes_token_id}")
         logger.info(f"DOWN Token (NO): {self.no_token_id}")
         
+        # Pré-aquecer cache do cliente (elimina HTTP frio na primeira ordem)
+        from .trading import warmup_client_cache
+        warmup_client_cache(self.settings, [self.yes_token_id, self.no_token_id])
+        
         # Extract market timestamp to calculate remaining time
         # The timestamp in the slug is when it OPENS, not when it closes
         # 15min markets close 15 minutes (900 seconds) later
@@ -193,18 +197,29 @@ class SimpleArbitrageBot:
         self._balance_refresh_task = asyncio.create_task(self._refresh_balance_loop())
 
     async def _refresh_balance_loop(self):
-        """Refresh do balance a cada 30s — nunca no hot path."""
+        """Refresh de balance E cache em background."""
+        from .trading import refresh_cache_if_needed
+        refresh_interval = 0
         while True:
             try:
                 if not self.settings.dry_run:
-                    new_balance = await asyncio.to_thread(
-                        get_balance, self.settings
-                    )
+                    # Balance a cada 30s
+                    new_balance = await asyncio.to_thread(get_balance, self.settings)
                     async with self._balance_lock:
                         self.cached_balance = new_balance
                     logger.debug(f"Balance actualizado: ${new_balance:.2f}")
+                    
+                    # Cache refresh a cada 4 minutos (8 x 30s = 240s = 4 min)
+                    refresh_interval += 1
+                    if refresh_interval >= 8:
+                        await asyncio.to_thread(
+                            refresh_cache_if_needed,
+                            self.settings,
+                            [self.yes_token_id, self.no_token_id]
+                        )
+                        refresh_interval = 0
             except Exception as e:
-                logger.debug(f"Erro a actualizar balance: {e}")
+                logger.debug(f"Background refresh error: {e}")
             await asyncio.sleep(30)
 
     def get_time_remaining(self) -> str:
@@ -438,9 +453,20 @@ class SimpleArbitrageBot:
                 "best_ask_down": fill_down.get("best"),
                 "vwap_up": fill_up.get("vwap"),
                 "vwap_down": fill_down.get("vwap"),
+                # Include fills for reuse in logging (avoid recalculating)
+                "_fill_up": fill_up,
+                "_fill_down": fill_down,
                 "timestamp": datetime.now().isoformat(),
             }
 
+        # Sem oportunidade — guardar fills para logging eficiente
+        self._last_fill_info = {
+            "price_up": up_book.get("best_ask"),
+            "price_down": down_book.get("best_ask"),
+            "fill_up": fill_up,
+            "fill_down": fill_down,
+            "total_cost": total_cost,
+        }
         return None
     
     async def execute_arbitrage_async(self, opportunity: dict):
@@ -1316,34 +1342,28 @@ class SimpleArbitrageBot:
                         await self.execute_arbitrage_async(opportunity)
                         continue
 
-                    # Minimal "no arb" logging using the same in-memory snapshot
-                    price_up = up_book.get("best_ask")
-                    price_down = down_book.get("best_ask")
-                    size_up = up_book.get("ask_size", 0)
-                    size_down = down_book.get("ask_size", 0)
-
-                    if price_up is not None and price_down is not None:
-                        best_total = float(price_up) + float(price_down)
-                        fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
-                        fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
-
-                        fill_msg = ""
-                        if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
-                            worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
-                            vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
-                            if vwap_total is not None:
-                                fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
-                            else:
-                                fill_msg = f" | fill(worst)=${worst_total:.4f}"
-
-                        logger.info(
-                            f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
-                            f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
-                            f"[Time: {self.get_time_remaining()}]"
-                        )
+                    # Usar _last_fill_info já calculado — sem recalcular
+                    if hasattr(self, '_last_fill_info') and self._last_fill_info:
+                        info = self._last_fill_info
+                        best_total = float(info.get("total_cost", 0))
+                        gap = self.settings.target_pair_cost - best_total
+                        
+                        # Logging condicional — só quando próximo do threshold ou verbose
+                        if self.settings.verbose or gap < 0.005:
+                            fu = info.get("fill_up", {})
+                            fd = info.get("fill_down", {})
+                            worst_total = ""
+                            if fu and fd and fu.get("worst") and fd.get("worst"):
+                                wt = float(fu["worst"]) + float(fd["worst"])
+                                vt = (float(fu.get("vwap", 0)) + float(fd.get("vwap", 0)))
+                                worst_total = f" worst=${wt:.4f} vwap=${vt:.4f}"
+                            logger.info(
+                                f"No arb: ${best_total:.4f}{worst_total} "
+                                f"gap=${gap:.4f} [{self.get_time_remaining()}]"
+                            )
                     else:
                         if self.settings.verbose:
-                            logger.info("WSS eval skipped: best ask missing (book not ready)")
+                            logger.info("WSS eval skipped: book not ready")
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as e:
