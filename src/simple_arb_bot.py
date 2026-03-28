@@ -63,8 +63,18 @@ def find_current_btc_15min_market() -> str:
         # 15min markets close 900s after the timestamp in the slug.
         now_ts = int(datetime.now().timestamp())
         all_ts = sorted((int(ts) for ts in matches), reverse=True)
-        open_ts = [ts for ts in all_ts if now_ts < (ts + 900)]
-        chosen_ts = open_ts[0] if open_ts else all_ts[0]
+        
+        # CONTRATO ACTIVO = já começou (ts <= now) E ainda não fechou (ts + 900 > now)
+        # O bug anterior escolhia o timestamp mais alto que ainda não fechou,
+        # que pode ser um contrato FUTURO (ainda não começou)
+        active_ts = [ts for ts in all_ts if ts <= now_ts and now_ts < (ts + 900)]
+        # Se não há activo, pegar o próximo a abrir (mais próximo)
+        upcoming_ts = [ts for ts in all_ts if ts > now_ts]
+        chosen_ts = active_ts[0] if active_ts else (upcoming_ts[0] if upcoming_ts else all_ts[0])
+        
+        logger.info(f"All timestamps found: {all_ts}")
+        logger.info(f"Active (started, not closed): {active_ts}")
+        logger.info(f"Upcoming: {upcoming_ts}")
         slug = f"btc-updown-15m-{chosen_ts}"
         
         logger.info(f"✅ Market found: {slug}")
