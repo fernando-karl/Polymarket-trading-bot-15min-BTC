@@ -1215,7 +1215,7 @@ class SimpleArbitrageBot:
                             logger.info(f"✅ New market found: {new_market_slug}")
                             logger.info("Restarting bot with new market...")
                             # Restart the bot with the new market
-                            self.__init__(self.settings)
+                            self.__init__(self.settings, market_slug=new_market_slug)
                             scan_count = 0
                             continue
                         else:
@@ -1294,7 +1294,7 @@ class SimpleArbitrageBot:
                     if new_market_slug != self.market_slug:
                         logger.info(f"✅ New market found: {new_market_slug}")
                         logger.info("Restarting bot with new market...")
-                        self.__init__(self.settings)
+                        self.__init__(self.settings, market_slug=new_market_slug)
                         continue
                     logger.info("⏳ Waiting for new market... (10s)")
                     await asyncio.sleep(10)
@@ -1339,7 +1339,7 @@ class SimpleArbitrageBot:
                             if new_market_slug != self.market_slug:
                                 logger.info(f"✅ New market found: {new_market_slug}")
                                 logger.info("Restarting bot with new market...")
-                                self.__init__(self.settings)
+                                self.__init__(self.settings, market_slug=new_market_slug)
                                 break
                             logger.info("⏳ Waiting for new market... (10s)")
                             await asyncio.sleep(10)
