@@ -15,6 +15,7 @@ from py_clob_client.clob_types import (
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Settings
+from .shared_rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,11 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
     if not token_id:
         raise ValueError("token_id is required")
 
+    # Rate limit check partilhado com pm_bot
+    rl = get_rate_limiter()
+    if not rl.check_and_increment():
+        raise RuntimeError("SHARED_RATE_LIMIT: aguardar antes de novo request")
+
     side_up = side.upper()
     if side_up not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
@@ -130,6 +136,11 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
     Returns:
         List of order results.
     """
+    # Rate limit check partilhado com pm_bot (batch = 1 request HTTP)
+    rl = get_rate_limiter()
+    if not rl.check_and_increment():
+        raise RuntimeError("SHARED_RATE_LIMIT: aguardar antes de novo request")
+
     client = get_client(settings)
 
     tif_up = (order_type or "GTC").upper()

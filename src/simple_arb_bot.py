@@ -21,6 +21,7 @@ from .lookup import fetch_market_from_slug
 from .risk_manager import RiskManager, RiskLimits
 from .statistics import StatisticsTracker
 from .trading import (
+    get_balance,
     get_client,
     place_order,
     get_positions,
@@ -153,7 +154,59 @@ class SimpleArbitrageBot:
 
         # Simple cooldown to avoid repeated orders on the same fleeting opportunity
         self._last_execution_ts = 0.0
-    
+
+        # Deal deduplication (evita entrar no mesmo deal duas vezes)
+        self._recent_deals: dict[str, float] = {}
+        self._deal_dedup_window_s = 10.0  # 10s window
+
+        # Balance refresh em background
+        self._balance_lock = asyncio.Lock()
+        self._balance_refresh_task: Optional[asyncio.Task] = None
+
+    def _deal_key(self, price_up: float, price_down: float) -> str:
+        """Generate a unique key for a deal to detect duplicates."""
+        return f"{price_up:.6f}_{price_down:.6f}"
+
+    def _is_duplicate_deal(self, price_up: float, price_down: float) -> bool:
+        """Verifica se já entrámos neste deal recentemente."""
+        key = self._deal_key(price_up, price_down)
+        now = time.time()
+        
+        # Limpar deals expirados
+        self._recent_deals = {
+            k: v for k, v in self._recent_deals.items() 
+            if now - v < self._deal_dedup_window_s
+        }
+        
+        if key in self._recent_deals:
+            logger.debug(f"Deal duplicado ignorado: {key} (entrado há {now - self._recent_deals[key]:.1f}s)")
+            return True
+        return False
+
+    def _register_deal(self, price_up: float, price_down: float) -> None:
+        """Regista deal para evitar duplicação."""
+        key = self._deal_key(price_up, price_down)
+        self._recent_deals[key] = time.time()
+
+    async def _start_background_tasks(self):
+        """Inicia tarefas em background (balance refresh)."""
+        self._balance_refresh_task = asyncio.create_task(self._refresh_balance_loop())
+
+    async def _refresh_balance_loop(self):
+        """Refresh do balance a cada 30s — nunca no hot path."""
+        while True:
+            try:
+                if not self.settings.dry_run:
+                    new_balance = await asyncio.to_thread(
+                        get_balance, self.settings
+                    )
+                    async with self._balance_lock:
+                        self.cached_balance = new_balance
+                    logger.debug(f"Balance actualizado: ${new_balance:.2f}")
+            except Exception as e:
+                logger.debug(f"Erro a actualizar balance: {e}")
+            await asyncio.sleep(30)
+
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
         if not self.market_end_timestamp:
@@ -390,18 +443,248 @@ class SimpleArbitrageBot:
 
         return None
     
-    def execute_arbitrage(self, opportunity: dict):
-        """Execute arbitrage by buying both sides."""
+    async def execute_arbitrage_async(self, opportunity: dict):
+        """Execute arbitrage by buying both sides (async version with all improvements).
+        
+        This is the async version that should be used in hot paths.
+        - Deal deduplication
+        - No wait_for_terminal_order for FOK
+        - Parallel wait for GTC/FAK
+        - Balance from cache (never HTTP in hot path)
+        """
+        price_up = opportunity['price_up']
+        price_down = opportunity['price_down']
 
-        # Cooldown guard (applies to both live and dry-run)
-        now = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else time.time()
+        # 1. DEDUPLICATION — não entrar no mesmo deal duas vezes
+        if self._is_duplicate_deal(price_up, price_down):
+            return
+
+        # 2. COOLDOWN — cooldown por deal, não global
+        now = asyncio.get_running_loop().time() if asyncio.get_running_loop().is_running() else time.time()
         if self.settings.cooldown_seconds and (now - self._last_execution_ts) < float(self.settings.cooldown_seconds):
             logger.info(f"Cooldown active ({self.settings.cooldown_seconds}s); skipping execution")
             return
         self._last_execution_ts = now
-        
-        # Count opportunity found (regardless of execution)
+
+        # Registar deal ANTES de executar para evitar race condition no WSS
+        self._register_deal(price_up, price_down)
         self.opportunities_found += 1
+
+        logger.info("=" * 70)
+        logger.info("🎯 ARBITRAGE OPPORTUNITY")
+        logger.info(f" UP: ${price_up:.4f}")
+        logger.info(f" DOWN: ${price_down:.4f}")
+        logger.info(f" Total: ${opportunity['total_cost']:.4f}")
+        logger.info(f" Profit: ${opportunity['expected_profit']:.4f} ({opportunity['profit_pct']:.2f}%)")
+        logger.info("=" * 70)
+
+        if self.settings.dry_run:
+            # Dry run: simular sem HTTP
+            if self.sim_balance < opportunity['total_investment']:
+                logger.error(f"❌ Balance simulado insuficiente")
+                return
+            self.sim_balance -= opportunity['total_investment']
+            self.total_invested += opportunity['total_investment']
+            self.total_shares_bought += opportunity['order_size'] * 2
+            self.positions.append(opportunity)
+            self.trades_executed += 1
+            logger.info(f"🔸 SIM: balance=${self.sim_balance:.2f}")
+            return
+
+        # 3. BALANCE DO CACHE — nunca HTTP no hot path
+        async with self._balance_lock:
+            current_balance = self.cached_balance
+
+        if current_balance is None:
+            # Primeira execução: fetch síncrono (inevitável)
+            current_balance = await asyncio.to_thread(get_balance, self.settings)
+            async with self._balance_lock:
+                self.cached_balance = current_balance
+
+        # Risk check
+        if self.risk_manager:
+            can_trade, reason = self.risk_manager.can_trade(
+                trade_size=opportunity['total_investment'],
+                current_balance=current_balance
+            )
+            if not can_trade:
+                logger.warning(f"⚠️ Risk blocked: {reason}")
+                return
+
+        required = opportunity['total_investment'] * (1 + self.settings.balance_slack if hasattr(self.settings, 'balance_slack') else 1.2)
+        if current_balance < required:
+            logger.error(f"❌ Balance insuficiente: ${current_balance:.2f} < ${required:.2f}")
+            return
+
+        try:
+            orders = [
+                {"side": "BUY", "token_id": self.yes_token_id,
+                 "price": price_up, "size": self.settings.order_size},
+                {"side": "BUY", "token_id": self.no_token_id,
+                 "price": price_down, "size": self.settings.order_size},
+            ]
+
+            order_type = getattr(self.settings, 'order_type', 'FOK')
+            logger.info(f"📤 Submetendo 2 ordens ({order_type})...")
+
+            # Submeter em background thread (não bloqueia event loop)
+            t_submit_start = time.time()
+            results = await asyncio.to_thread(
+                place_orders_fast, self.settings, orders, order_type=order_type
+            )
+            t_submit_ms = (time.time() - t_submit_start) * 1000
+            logger.info(f" Submissão: {t_submit_ms:.0f}ms")
+
+            # Extrair order IDs
+            submission_errors = []
+            order_ids = [None, None]
+            for idx, r in enumerate((results or [])[:2]):
+                if isinstance(r, dict) and "error" in r:
+                    submission_errors.append(str(r.get("error")))
+                    continue
+                oid = extract_order_id(r) if isinstance(r, dict) else None
+                order_ids[idx] = oid
+
+            if submission_errors:
+                for msg in submission_errors:
+                    logger.error(f"❌ Submit error: {msg}")
+
+            if not order_ids[0] or not order_ids[1]:
+                raise RuntimeError(f"Order IDs não extraídos: {results}")
+
+            up_order_id, down_order_id = order_ids
+
+            # 4. VERIFICAR FILLS — FOK sem polling, GTC/FAK em paralelo
+            t_verify_start = time.time()
+            up_state, down_state = await self._verify_both_fills_async(
+                up_order_id, down_order_id, order_type=order_type
+            )
+            t_verify_ms = (time.time() - t_verify_start) * 1000
+            logger.info(f" Verificação fills: {t_verify_ms:.0f}ms")
+
+            up_filled = bool(up_state.get("filled"))
+            down_filled = bool(down_state.get("filled"))
+            up_filled_size = float(up_state.get("filled_size") or 0.0)
+            down_filled_size = float(down_state.get("filled_size") or 0.0)
+
+            logger.info(
+                f" UP: {up_state.get('status')} filled={up_filled_size:.2f} | "
+                f"DOWN: {down_state.get('status')} filled={down_filled_size:.2f}"
+            )
+
+            if not (up_filled and down_filled):
+                # Cleanup: cancelar ordens abertas
+                try:
+                    await asyncio.to_thread(
+                        cancel_orders, self.settings, [up_order_id, down_order_id]
+                    )
+                except Exception as ce:
+                    logger.warning(f"Cancel cleanup falhou: {ce}")
+
+                # Tentar unwind se só um leg preencheu
+                req_size = float(self.settings.order_size)
+                filled_token_id = None
+                filled_size = 0.0
+                if up_filled and not down_filled:
+                    filled_token_id = self.yes_token_id
+                    filled_size = up_filled_size if up_filled_size > 0 else req_size
+                elif down_filled and not up_filled:
+                    filled_token_id = self.no_token_id
+                    filled_size = down_filled_size if down_filled_size > 0 else req_size
+
+                if filled_token_id and filled_size > 0:
+                    logger.warning("⚠️ Fill parcial — a tentar unwind")
+                    try:
+                        book = await asyncio.to_thread(
+                            self.get_order_book, filled_token_id
+                        )
+                        best_bid = book.get("best_bid")
+                        if best_bid:
+                            await asyncio.to_thread(
+                                place_order, self.settings,
+                                side="SELL", token_id=filled_token_id,
+                                price=float(best_bid), size=float(filled_size),
+                                tif="FAK"
+                            )
+                            logger.info(f"Unwind SELL submetido @ {best_bid:.4f}")
+                    except Exception as ue:
+                        logger.error(f"❌ Unwind falhou: {ue}")
+
+                raise RuntimeError("Paired execution falhou (não ambos os legs)")
+
+            logger.info("✅ ARBITRAGE EXECUTADO (AMBOS OS LEGS FILLED)")
+            self.trades_executed += 1
+            self.total_invested += opportunity['total_investment']
+            self.total_shares_bought += opportunity['order_size'] * 2
+            self.positions.append(opportunity)
+
+            if self.stats_tracker:
+                self.stats_tracker.record_trade(
+                    market_slug=self.market_slug,
+                    price_up=price_up,
+                    price_down=price_down,
+                    total_cost=opportunity['total_cost'],
+                    order_size=opportunity['order_size'],
+                    order_ids=[up_order_id, down_order_id],
+                    filled=True,
+                )
+
+            if self.risk_manager:
+                self.risk_manager.record_trade_result(profit=opportunity['expected_profit'])
+
+            # Forçar refresh do balance após trade
+            new_balance = await asyncio.to_thread(get_balance, self.settings)
+            async with self._balance_lock:
+                self.cached_balance = new_balance
+            logger.info(f"💰 Balance: ${new_balance:.2f}")
+
+        except Exception as e:
+            logger.error(f"❌ Erro a executar arbitrage: {e}")
+
+    async def _verify_both_fills_async(
+        self, up_order_id: str, down_order_id: str, *, order_type: str
+    ) -> tuple[dict, dict]:
+        """Verifica fills para ambas as ordens em paralelo.
+        
+        FOK: polling rápido porque são fills imediatos
+        GTC/FAK: polling com tempo maior
+        """
+        import asyncio
+        
+        req_size = float(self.settings.order_size)
+        timeout = 3.0 if order_type.upper() == "FOK" else 10.0
+        
+        async def get_order_state(order_id: str) -> dict:
+            start = time.time()
+            while time.time() - start < timeout:
+                state = await asyncio.to_thread(
+                    wait_for_terminal_order, self.settings, order_id,
+                    requested_size=req_size, timeout_seconds=0.5
+                )
+                if state.get("terminal"):
+                    return state
+                await asyncio.sleep(0.1)
+            return {"status": "timeout", "filled": False}
+
+        up_state, down_state = await asyncio.gather(
+            get_order_state(up_order_id),
+            get_order_state(down_order_id)
+        )
+        return up_state, down_state
+
+    def execute_arbitrage(self, opportunity: dict):
+        """Execute arbitrage by buying both sides (sync version - DEPRECATED, use execute_arbitrage_async)."""
+        # Versão sync para compatibilidade - chama a async
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Se já estamos num loop, agendar e retornar
+                asyncio.create_task(self.execute_arbitrage_async(opportunity))
+            else:
+                loop.run_until_complete(self.execute_arbitrage_async(opportunity))
+        except RuntimeError:
+            # No loop existe, criar um novo
+            asyncio.run(self.execute_arbitrage_async(opportunity))
         
         logger.info("=" * 70)
         logger.info("🎯 ARBITRAGE OPPORTUNITY DETECTED")
@@ -755,7 +1038,7 @@ class SimpleArbitrageBot:
         opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
         
         if opportunity:
-            self.execute_arbitrage(opportunity)
+            asyncio.create_task(self.execute_arbitrage_async(opportunity))
             return True
         else:
             price_up = up_book.get("best_ask")
@@ -799,7 +1082,7 @@ class SimpleArbitrageBot:
         opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
 
         if opportunity:
-            self.execute_arbitrage(opportunity)
+            await self.execute_arbitrage_async(opportunity)
             return True
 
         price_up = up_book.get("best_ask")
@@ -932,6 +1215,9 @@ class SimpleArbitrageBot:
 
     async def monitor_wss(self):
         """Monitor using Polymarket CLOB Market WebSocket instead of polling."""
+        # Iniciar background tasks (balance refresh)
+        await self._start_background_tasks()
+        
         # This loop keeps WSS running across market rollovers.
         while True:
             # If the detected market is already closed, rollover immediately.
@@ -1027,7 +1313,7 @@ class SimpleArbitrageBot:
 
                     opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
                     if opportunity:
-                        self.execute_arbitrage(opportunity)
+                        await self.execute_arbitrage_async(opportunity)
                         continue
 
                     # Minimal "no arb" logging using the same in-memory snapshot
