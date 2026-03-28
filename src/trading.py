@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import functools
 import logging
 from typing import Optional
@@ -339,3 +341,72 @@ def get_positions(settings: Settings, token_ids: list[str] = None) -> dict:
     except Exception as e:
         logger.error(f"Error getting positions: {e}")
         return {}
+
+
+# Thread pool para operações de IO paralelas
+_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+async def wait_for_terminal_order_async(
+    settings,
+    order_id: str,
+    *,
+    requested_size: Optional[float] = None,
+    timeout_seconds: float = 3.0,
+    poll_interval_seconds: float = 0.25,
+) -> dict:
+    """Versão async de wait_for_terminal_order — não bloqueia o event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _thread_pool,
+        lambda: wait_for_terminal_order(
+            settings,
+            order_id,
+            requested_size=requested_size,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        ),
+    )
+
+
+async def verify_both_fills_async(
+    settings,
+    up_order_id: str,
+    down_order_id: str,
+    order_size: float,
+    order_type: str = "FOK",
+) -> tuple[dict, dict]:
+    """
+    Verifica fills dos dois legs.
+    
+    FOK: assume fill imediato se order_id retornou sem erro.
+    Não faz polling — FOK ou preenche ou cancela na submissão.
+    
+    GTC/FAK: verifica em paralelo com timeout de 3s.
+    """
+    if order_type.upper() == "FOK":
+        # FOK não precisa de polling — se temos o order_id, a ordem foi aceite.
+        # O fill aconteceu na submissão ou foi cancelado (e teremos error no result).
+        up_result = {
+            "status": "filled",
+            "filled_size": order_size,
+            "filled": True,
+            "terminal": True,
+        }
+        down_result = {
+            "status": "filled",
+            "filled_size": order_size,
+            "filled": True,
+            "terminal": True,
+        }
+        return up_result, down_result
+    else:
+        # GTC/FAK: verificar em paralelo (não sequencial!)
+        up_task = wait_for_terminal_order_async(
+            settings, up_order_id, requested_size=order_size
+        )
+        down_task = wait_for_terminal_order_async(
+            settings, down_order_id, requested_size=order_size
+        )
+        up_state, down_state = await asyncio.gather(up_task, down_task)
+        return up_state, down_state
