@@ -44,6 +44,10 @@ class Settings:
     enable_stats: bool = os.getenv("ENABLE_STATS", "true").lower() == "true"
     trade_log_file: str = os.getenv("TRADE_LOG_FILE", "trades.json")
     use_rich_output: bool = os.getenv("USE_RICH_OUTPUT", "true").lower() == "true"
+    
+    # Telegram notifications
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
 def load_settings() -> Settings:

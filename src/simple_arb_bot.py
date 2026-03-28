@@ -148,6 +148,15 @@ class SimpleArbitrageBot:
         from .trading import warmup_client_cache
         warmup_client_cache(self.settings, [self.yes_token_id, self.no_token_id])
         
+        # Telegram notifier
+        self.notifier = None
+        if settings.telegram_bot_token and settings.telegram_chat_id:
+            from .telegram_notifier import TelegramNotifier
+            self.notifier = TelegramNotifier(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id
+            )
+        
         # Extract market timestamp to calculate remaining time
         # The timestamp in the slug is when it OPENS, not when it closes
         # 15min markets close 15 minutes (900 seconds) later
@@ -520,6 +529,18 @@ class SimpleArbitrageBot:
         logger.info(f" Total: ${opportunity['total_cost']:.4f}")
         logger.info(f" Profit: ${opportunity['expected_profit']:.4f} ({opportunity['profit_pct']:.2f}%)")
         logger.info("=" * 70)
+
+        # Send Telegram notification
+        if self.notifier:
+            time_remaining = self.get_time_remaining()
+            self.notifier.send_opportunity_alert(
+                market=self.market_slug,
+                price_up=price_up,
+                price_down=price_down,
+                total_cost=opportunity['total_cost'],
+                profit_pct=opportunity['profit_pct'],
+                time_remaining=time_remaining,
+            )
 
         if self.settings.dry_run:
             # Dry run: simular sem HTTP
