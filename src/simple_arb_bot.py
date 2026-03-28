@@ -90,7 +90,7 @@ def find_current_btc_15min_market() -> str:
 class SimpleArbitrageBot:
     """Simple bot implementing Jeremy Whittaker's strategy."""
     
-    def __init__(self, settings):
+    def __init__(self, settings, market_slug: str = None):
         self.settings = settings
         self.client = get_client(settings)
         
@@ -114,16 +114,22 @@ class SimpleArbitrageBot:
             )
             self.risk_manager = RiskManager(risk_limits)
         
-        # Try to find current BTC 15min market automatically
+        # Try to find current market — auto-detect or use provided slug
         try:
-            market_slug = find_current_btc_15min_market()
+            if market_slug:
+                logger.info(f"Using provided market: {market_slug}")
+            elif settings.market_slug:
+                logger.info(f"Using configured market: {settings.market_slug}")
+                market_slug = settings.market_slug
+            else:
+                market_slug = find_current_btc_15min_market()
         except Exception as e:
             # Fallback: use the slug configured in .env
             if settings.market_slug:
                 logger.info(f"Using configured market: {settings.market_slug}")
                 market_slug = settings.market_slug
             else:
-                raise RuntimeError("Could not find BTC 15min market and no slug configured in .env")
+                raise RuntimeError("Could not find market and no slug configured")
         
         # Get token IDs from the market
         logger.info(f"Getting market information: {market_slug}")
