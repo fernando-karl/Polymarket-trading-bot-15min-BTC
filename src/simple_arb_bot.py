@@ -195,7 +195,8 @@ class SimpleArbitrageBot:
 
     def _deal_key(self, price_up: float, price_down: float) -> str:
         """Generate a unique key for a deal to detect duplicates."""
-        return f"{price_up:.6f}_{price_down:.6f}"
+        # Market slug is critical — same prices on BTC vs ETH are DIFFERENT deals
+        return f"{self.market_slug}:{price_up:.6f}:{price_down:.6f}"
 
     def _is_duplicate_deal(self, price_up: float, price_down: float) -> bool:
         """Verifica se já entrámos neste deal recentemente."""
