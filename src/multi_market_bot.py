@@ -113,7 +113,7 @@ class MultiMarketBot:
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=10
             )
-            now = int(__import__('datetime').datetime.now().timestamp())
+            now = int(__import__('time').time())
             
             for pattern, name in [
                 (r'(btc)-[a-z]+-15m-(\d+)', 'BTC'),
@@ -161,7 +161,7 @@ async def main():
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=10
             )
-            now = int(__import__('datetime').datetime.now().timestamp())
+            now = int(__import__('time').time())
             markets = {}
             for pattern, name in [
                 (r'(btc)-[a-z]+-15m-(\d+)', 'BTC'),
