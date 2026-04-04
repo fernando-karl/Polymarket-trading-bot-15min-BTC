@@ -562,10 +562,13 @@ class SimpleArbitrageBot:
             current_balance = self.cached_balance
 
         if current_balance is None:
-            # Primeira execução: fetch síncrono (inevitável)
+            logger.info(f"💰 Balance: fetching from API (first call)...")
             current_balance = await asyncio.to_thread(get_balance, self.settings)
             async with self._balance_lock:
                 self.cached_balance = current_balance
+            logger.info(f"💰 Balance fetched: ${current_balance:.2f}")
+        else:
+            logger.info(f"💰 Balance (cached): ${current_balance:.2f}")
 
         # Risk check
         if self.risk_manager:
@@ -573,11 +576,13 @@ class SimpleArbitrageBot:
                 trade_size=opportunity['total_investment'],
                 current_balance=current_balance
             )
+            logger.info(f"🛡️ Risk check: can_trade={can_trade} reason={reason}")
             if not can_trade:
                 logger.warning(f"⚠️ Risk blocked: {reason}")
                 return
 
         required = opportunity['total_investment'] * (1 + self.settings.balance_slack if hasattr(self.settings, 'balance_slack') else 1.2)
+        logger.info(f"💰 Balance check: ${current_balance:.2f} vs required ${required:.2f} → {'✅ OK' if current_balance >= required else '❌ INSUFFICIENT'}")
         if current_balance < required:
             logger.error(f"❌ Balance insuficiente: ${current_balance:.2f} < ${required:.2f}")
             return
@@ -591,7 +596,7 @@ class SimpleArbitrageBot:
             ]
 
             order_type = getattr(self.settings, 'order_type', 'FOK')
-            logger.info(f"📤 Submetendo 2 ordens ({order_type})...")
+            logger.info(f"📤 Submetendo 2 ordens ({order_type}) — UP ${price_up} x {self.settings.order_size} + DOWN ${price_down} x {self.settings.order_size}")
 
             # Submeter em background thread (não bloqueia event loop)
             t_submit_start = time.time()
@@ -614,6 +619,8 @@ class SimpleArbitrageBot:
             if submission_errors:
                 for msg in submission_errors:
                     logger.error(f"❌ Submit error: {msg}")
+            else:
+                logger.info(f"📤 Orders submitted — UP id={order_ids[0]} DOWN id={order_ids[1]}")
 
             if not order_ids[0] or not order_ids[1]:
                 raise RuntimeError(f"Order IDs não extraídos: {results}")
@@ -634,11 +641,12 @@ class SimpleArbitrageBot:
             down_filled_size = float(down_state.get("filled_size") or 0.0)
 
             logger.info(
-                f" UP: {up_state.get('status')} filled={up_filled_size:.2f} | "
-                f"DOWN: {down_state.get('status')} filled={down_filled_size:.2f}"
+                f"📊 Fill result — UP: {up_state.get('status')} ({up_filled_size:.2f}) | "
+                f"DOWN: {down_state.get('status')} ({down_filled_size:.2f})"
             )
 
             if not (up_filled and down_filled):
+                logger.warning(f"⚠️ Partial fill — UP={up_filled} DOWN={down_filled} — cleanup")
                 # Cleanup: cancelar ordens abertas
                 try:
                     await asyncio.to_thread(
