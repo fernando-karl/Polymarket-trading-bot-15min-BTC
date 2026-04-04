@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -8,7 +9,7 @@ import websockets
 
 
 def _now_s() -> float:
-    return time.time()
+    return time.monotonic()
 
 
 @dataclass
@@ -137,7 +138,9 @@ class MarketWssClient:
         # Avoid hanging forever on network/proxy/firewall issues
         open_timeout_s = 10
 
-        # Basic reconnect loop
+        # Reconnect loop with exponential backoff + jitter
+        backoff_s = 1.0
+        max_backoff_s = 30.0
         while True:
             try:
                 log_connect_throttled(f"[WSS] Connecting to {url}...")
@@ -152,6 +155,7 @@ class MarketWssClient:
                     # Per docs: type is "MARKET" and the field name is "assets_ids".
                     await ws.send(json.dumps({"assets_ids": self.asset_ids, "type": "MARKET"}))
                     print(f"[WSS] Subscribed to {len(self.asset_ids)} asset_ids")
+                    backoff_s = 1.0  # reset on successful connection
 
                     while True:
                         raw = await ws.recv()
@@ -203,6 +207,9 @@ class MarketWssClient:
                 except Exception:
                     extra = ""
 
-                print(f"[WSS] Connection error ({type(e).__name__}: {e}){extra}; retrying...")
-                await asyncio.sleep(1.0)
+                jitter = random.uniform(0, backoff_s * 0.5)
+                wait = min(backoff_s + jitter, max_backoff_s)
+                print(f"[WSS] Connection error ({type(e).__name__}: {e}){extra}; retrying in {wait:.1f}s...")
+                await asyncio.sleep(wait)
+                backoff_s = min(backoff_s * 2, max_backoff_s)
                 continue

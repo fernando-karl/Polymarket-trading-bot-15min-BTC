@@ -117,5 +117,26 @@ class TestRateLimiterStats:
         assert "t0" in stats
 
 
+class TestGetRateLimiterInterface:
+    """Verify get_rate_limiter() returns an object with .check_and_increment()."""
+
+    def test_returns_object_with_method(self):
+        from src.shared_rate_limiter import get_rate_limiter
+        rl = get_rate_limiter()
+        assert hasattr(rl, "check_and_increment")
+        assert callable(rl.check_and_increment)
+
+    def test_check_and_increment_delegates(self, tmp_path, monkeypatch):
+        """check_and_increment() should delegate to module-level function."""
+        import src.shared_rate_limiter as mod
+        # Use a temp file so we don't touch the shared state
+        monkeypatch.setattr(mod, "RATE_STATE_PATH", str(tmp_path / "rate.json"))
+        # Reset singleton so it picks up the class version
+        monkeypatch.setattr(mod, "_rate_limiter", None)
+        rl = mod.get_rate_limiter()
+        result = rl.check_and_increment()
+        assert result is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

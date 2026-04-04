@@ -173,6 +173,13 @@ class TestPlaceOrdersFast:
         assert len(results) == 2
         patch_trading.post_orders.assert_called_once()
 
+    def test_parallel_signing_calls_create_order_for_each(self, patch_trading, make_settings):
+        """Parallel signing must call create_order once per order."""
+        patch_trading.create_order.return_value = MagicMock()
+        patch_trading.post_orders.return_value = [{"orderID": "o1"}, {"orderID": "o2"}]
+        place_orders_fast(make_settings(), self._make_orders())
+        assert patch_trading.create_order.call_count == 2
+
     def test_batch_fails_falls_back_to_sequential(self, patch_trading, make_settings):
         patch_trading.create_order.return_value = MagicMock()
         patch_trading.post_orders.side_effect = RuntimeError("batch fail")

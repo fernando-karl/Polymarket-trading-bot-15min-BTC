@@ -202,14 +202,14 @@ class SimpleArbitrageBot:
     def _is_duplicate_deal(self, price_up: float, price_down: float) -> bool:
         """Verifica se já entrámos neste deal recentemente."""
         key = self._deal_key(price_up, price_down)
-        now = time.time()
-        
+        now = time.monotonic()
+
         # Limpar deals expirados
         self._recent_deals = {
-            k: v for k, v in self._recent_deals.items() 
+            k: v for k, v in self._recent_deals.items()
             if now - v < self._deal_dedup_window_s
         }
-        
+
         if key in self._recent_deals:
             logger.debug(f"Deal duplicado ignorado: {key} (entrado há {now - self._recent_deals[key]:.1f}s)")
             return True
@@ -218,7 +218,7 @@ class SimpleArbitrageBot:
     def _register_deal(self, price_up: float, price_down: float) -> None:
         """Regista deal para evitar duplicação."""
         key = self._deal_key(price_up, price_down)
-        self._recent_deals[key] = time.time()
+        self._recent_deals[key] = time.monotonic()
 
     async def _start_background_tasks(self):
         """Inicia tarefas em background (balance refresh)."""
@@ -514,7 +514,8 @@ class SimpleArbitrageBot:
             return
 
         # 2. COOLDOWN — cooldown por deal, não global
-        now = asyncio.get_running_loop().time() if asyncio.get_running_loop().is_running() else time.time()
+        # Use monotonic clock consistently (immune to NTP jumps)
+        now = time.monotonic()
         if self.settings.cooldown_seconds and (now - self._last_execution_ts) < float(self.settings.cooldown_seconds):
             logger.info(f"Cooldown active ({self.settings.cooldown_seconds}s); skipping execution")
             return
@@ -587,6 +588,7 @@ class SimpleArbitrageBot:
             logger.error(f"❌ Balance insuficiente: ${current_balance:.2f} < ${required:.2f}")
             return
 
+        t_hotpath_start = time.perf_counter()
         try:
             orders = [
                 {"side": "BUY", "token_id": self.yes_token_id,
@@ -599,11 +601,11 @@ class SimpleArbitrageBot:
             logger.info(f"📤 Submetendo 2 ordens ({order_type}) — UP ${price_up} x {self.settings.order_size} + DOWN ${price_down} x {self.settings.order_size}")
 
             # Submeter em background thread (não bloqueia event loop)
-            t_submit_start = time.time()
+            t_submit_start = time.perf_counter()
             results = await asyncio.to_thread(
                 place_orders_fast, self.settings, orders, order_type=order_type
             )
-            t_submit_ms = (time.time() - t_submit_start) * 1000
+            t_submit_ms = (time.perf_counter() - t_submit_start) * 1000
             logger.info(f" Submissão: {t_submit_ms:.0f}ms")
 
             # Extrair order IDs
@@ -628,11 +630,11 @@ class SimpleArbitrageBot:
             up_order_id, down_order_id = order_ids
 
             # 4. VERIFICAR FILLS — FOK sem polling, GTC/FAK em paralelo
-            t_verify_start = time.time()
+            t_verify_start = time.perf_counter()
             up_state, down_state = await self._verify_both_fills_async(
                 up_order_id, down_order_id, order_type=order_type
             )
-            t_verify_ms = (time.time() - t_verify_start) * 1000
+            t_verify_ms = (time.perf_counter() - t_verify_start) * 1000
             logger.info(f" Verificação fills: {t_verify_ms:.0f}ms")
 
             up_filled = bool(up_state.get("filled"))
@@ -686,7 +688,8 @@ class SimpleArbitrageBot:
 
                 raise RuntimeError("Paired execution falhou (não ambos os legs)")
 
-            logger.info("✅ ARBITRAGE EXECUTADO (AMBOS OS LEGS FILLED)")
+            t_hotpath_ms = (time.perf_counter() - t_hotpath_start) * 1000
+            logger.info(f"✅ ARBITRAGE EXECUTADO (AMBOS OS LEGS FILLED) — total hot-path: {t_hotpath_ms:.0f}ms")
             self.trades_executed += 1
             self.total_invested += opportunity['total_investment']
             self.total_shares_bought += opportunity['order_size'] * 2
@@ -718,19 +721,29 @@ class SimpleArbitrageBot:
     async def _verify_both_fills_async(
         self, up_order_id: str, down_order_id: str, *, order_type: str
     ) -> tuple[dict, dict]:
-        """Verifica fills para ambas as ordens em paralelo.
-        
-        FOK: polling rápido porque são fills imediatos
-        GTC/FAK: polling com tempo maior
+        """Verify fills for both legs.
+
+        FOK: fill-or-kill at submission — if we got an order ID without error
+        the order was filled.  No polling needed (saves ~0.5-3 s per trade).
+        GTC/FAK: poll in parallel with 10 s timeout.
         """
-        import asyncio
-        
         req_size = float(self.settings.order_size)
-        timeout = 3.0 if order_type.upper() == "FOK" else 10.0
-        
+
+        if order_type.upper() == "FOK":
+            filled = {
+                "status": "filled",
+                "filled_size": req_size,
+                "filled": True,
+                "terminal": True,
+            }
+            return filled, filled
+
+        # GTC / FAK — poll both legs concurrently
+        timeout = 10.0
+
         async def get_order_state(order_id: str) -> dict:
-            start = time.time()
-            while time.time() - start < timeout:
+            start = time.monotonic()
+            while time.monotonic() - start < timeout:
                 state = await asyncio.to_thread(
                     wait_for_terminal_order, self.settings, order_id,
                     requested_size=req_size, timeout_seconds=0.5
@@ -1258,23 +1271,11 @@ class SimpleArbitrageBot:
             logger.info("=" * 70)
 
     def _book_from_state(self, bid_levels: list[tuple[float, float]], ask_levels: list[tuple[float, float]]) -> dict:
-        best_bid = max((p for p, _ in bid_levels), default=None)
-        best_ask = min((p for p, _ in ask_levels), default=None)
-
-        bid_size = 0.0
-        if best_bid is not None:
-            for p, s in bid_levels:
-                if p == best_bid:
-                    bid_size = s
-                    break
-
-        ask_size = 0.0
-        if best_ask is not None:
-            for p, s in ask_levels:
-                if p == best_ask:
-                    ask_size = s
-                    break
-
+        """Build book dict from pre-sorted levels (O(1) — levels are sorted by to_levels())."""
+        best_bid = bid_levels[0][0] if bid_levels else None   # bids sorted desc
+        best_ask = ask_levels[0][0] if ask_levels else None   # asks sorted asc
+        bid_size = bid_levels[0][1] if bid_levels else 0.0
+        ask_size = ask_levels[0][1] if ask_levels else 0.0
         spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
 
         return {
@@ -1344,8 +1345,9 @@ class SimpleArbitrageBot:
             )
 
             last_eval = 0.0
-            eval_min_interval_s = 0.05  # avoid evaluating too frequently on rapid deltas
+            eval_min_interval_s = 0.05  # default 50ms debounce
             eval_count = 0
+            _last_gap = float('inf')  # distance from arb threshold (for adaptive debounce)
 
             try:
                 async for asset_id, event_type in client.run():
@@ -1371,8 +1373,15 @@ class SimpleArbitrageBot:
                             await asyncio.sleep(10)
                             break
 
-                    # Debounce evaluation
+                    # Adaptive debounce: evaluate faster when prices approach threshold
                     now = asyncio.get_running_loop().time()
+                    if _last_gap < 0.005:
+                        eval_min_interval_s = 0.005   # 5ms  — within 0.5% of threshold
+                    elif _last_gap < 0.02:
+                        eval_min_interval_s = 0.02    # 20ms — within 2%
+                    else:
+                        eval_min_interval_s = 0.05    # 50ms — normal
+
                     if (now - last_eval) < eval_min_interval_s:
                         continue
                     last_eval = now
@@ -1399,16 +1408,18 @@ class SimpleArbitrageBot:
                     opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
                     if opportunity:
                         await self.execute_arbitrage_async(opportunity)
+                        _last_gap = 0.0  # just captured — stay in high-alert mode
                         continue
 
-                    # Usar _last_fill_info já calculado — sem recalcular
+                    # Update gap for next adaptive debounce decision
                     if hasattr(self, '_last_fill_info') and self._last_fill_info:
                         info = self._last_fill_info
                         best_total = float(info.get("total_cost", 0))
+                        _last_gap = best_total - self.settings.target_pair_cost
+
                         gap = self.settings.target_pair_cost - best_total
-                        
                         # Logging condicional — só quando próximo do threshold ou verbose
-                        if self.settings.verbose or gap < 0.005:
+                        if self.settings.verbose or gap > -0.005:
                             fu = info.get("fill_up", {})
                             fd = info.get("fill_down", {})
                             worst_total = ""
@@ -1418,9 +1429,10 @@ class SimpleArbitrageBot:
                                 worst_total = f" worst=${wt:.4f} vwap=${vt:.4f}"
                             logger.info(
                                 f"No arb: ${best_total:.4f}{worst_total} "
-                                f"gap=${gap:.4f} [{self.get_time_remaining()}]"
+                                f"gap=${gap:.4f} debounce={eval_min_interval_s*1000:.0f}ms [{self.get_time_remaining()}]"
                             )
                     else:
+                        _last_gap = float('inf')
                         if self.settings.verbose:
                             logger.info("WSS eval skipped: book not ready")
             except asyncio.CancelledError:

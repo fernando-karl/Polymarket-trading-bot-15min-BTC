@@ -80,14 +80,19 @@ def get_stats() -> dict:
         return {}
 
 
+class _SharedRateLimiter:
+    """Object wrapper so callers can use rl.check_and_increment()."""
+
+    def check_and_increment(self, writer: str = "arb_bot") -> bool:
+        return check_and_increment(writer)
+
+
 _rate_limiter = None
 
 
 def get_rate_limiter():
-    """Retorna uma função wrapper para compatibilidade."""
+    """Returns a singleton rate limiter with .check_and_increment() method."""
     global _rate_limiter
     if _rate_limiter is None:
-        def wrapper():
-            return check_and_increment()
-        _rate_limiter = wrapper
+        _rate_limiter = _SharedRateLimiter()
     return _rate_limiter

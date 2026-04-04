@@ -118,15 +118,56 @@ class TestDealDeduplication:
     def test_expired_deal_allowed(self, make_settings):
         bot = _make_test_bot(make_settings)
         bot._register_deal(0.48, 0.48)
-        # Backdate the timestamp so it's expired
+        # Backdate the timestamp so it's expired (uses monotonic clock)
         key = bot._deal_key(0.48, 0.48)
-        bot._recent_deals[key] = time.time() - 20  # well past the 10s window
+        bot._recent_deals[key] = time.monotonic() - 20  # well past the 10s window
         assert bot._is_duplicate_deal(0.48, 0.48) is False
 
 
 # ---------------------------------------------------------------------------
 # Dry-run execution
 # ---------------------------------------------------------------------------
+
+
+class TestFokFillVerification:
+    """FOK orders must skip polling — fill is guaranteed at submission."""
+
+    def test_fok_returns_immediately(self, make_settings):
+        bot = _make_test_bot(make_settings, order_size=10)
+
+        async def _run():
+            up, down = await bot._verify_both_fills_async(
+                "order-up", "order-down", order_type="FOK"
+            )
+            return up, down
+
+        up, down = asyncio.run(_run())
+        assert up["filled"] is True
+        assert up["terminal"] is True
+        assert up["filled_size"] == 10
+        assert down["filled"] is True
+
+
+class TestBookFromState:
+    """_book_from_state uses O(1) lookups on pre-sorted levels."""
+
+    def test_extracts_best_bid_ask(self, make_settings):
+        bot = _make_test_bot(make_settings)
+        bids = [(0.52, 75), (0.50, 100), (0.48, 50)]  # sorted desc
+        asks = [(0.49, 80), (0.51, 100), (0.53, 50)]   # sorted asc
+        book = bot._book_from_state(bids, asks)
+        assert book["best_bid"] == 0.52
+        assert book["best_ask"] == 0.49
+        assert book["bid_size"] == 75
+        assert book["ask_size"] == 80
+        assert book["spread"] == pytest.approx(-0.03)
+
+    def test_empty_levels(self, make_settings):
+        bot = _make_test_bot(make_settings)
+        book = bot._book_from_state([], [])
+        assert book["best_bid"] is None
+        assert book["best_ask"] is None
+        assert book["spread"] is None
 
 
 class TestDryRunExecution:

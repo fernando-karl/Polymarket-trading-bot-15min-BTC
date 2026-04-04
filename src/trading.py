@@ -130,6 +130,18 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
 
 
 
+def _sign_one_order(client, order_params: dict, options) -> object:
+    """Sign a single order.  Thread-safe (pure crypto, no shared mutable state)."""
+    side_up = order_params["side"].upper()
+    order_args = OrderArgs(
+        token_id=order_params["token_id"],
+        price=order_params["price"],
+        size=order_params["size"],
+        side=BUY if side_up == "BUY" else SELL,
+    )
+    return client.create_order(order_args, options)
+
+
 def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str = "GTC") -> list[dict]:
     """Place multiple orders as fast as possible.
 
@@ -154,20 +166,15 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
     tif_up = (order_type or "GTC").upper()
     ot = getattr(OrderType, tif_up, OrderType.GTC)
 
-    # Step 1: Pre-sign all orders (this is the slow part)
-    # Force neg_risk=True for BTC 15min markets (auto-detection fails)
+    # Step 1: Pre-sign all orders in PARALLEL.
+    # Crypto signing uses C extensions (coincurve) that release the GIL,
+    # so threads give real parallelism.  For 2 legs this halves signing time.
     options = PartialCreateOrderOptions(neg_risk=True)
-    signed_orders = []
-    for order_params in orders:
-        side_up = order_params["side"].upper()
-        order_args = OrderArgs(
-            token_id=order_params["token_id"],
-            price=order_params["price"],
-            size=order_params["size"],
-            side=BUY if side_up == "BUY" else SELL,
-        )
-        signed_order = client.create_order(order_args, options)
-        signed_orders.append(signed_order)
+    if len(orders) >= 2:
+        futures = [_thread_pool.submit(_sign_one_order, client, op, options) for op in orders]
+        signed_orders = [f.result() for f in futures]
+    else:
+        signed_orders = [_sign_one_order(client, orders[0], options)]
 
     # Step 2: Post all orders in a single request when possible.
     try:
