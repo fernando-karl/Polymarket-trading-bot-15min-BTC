@@ -1,231 +1,242 @@
 """
-Tests for trading module (order execution, rate limiting).
+Tests for trading module — real calls to source functions with mocked I/O.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
-import time
+from unittest.mock import MagicMock, patch
+
+from src.trading import (
+    extract_order_id,
+    get_balance,
+    place_order,
+    place_orders_fast,
+    summarize_order_state,
+    wait_for_terminal_order,
+)
 
 
-class TestOrderTypes:
-    """Tests for order type handling."""
-    
-    def test_fok_order_type(self):
-        """Test FOK (Fill Or Kill) order type."""
-        order_type = "FOK"
-        
-        # FOK should fill immediately or not at all
-        assert order_type.upper() == "FOK"
-    
-    def test_fak_order_type(self):
-        """Test FAK (Fill And Kill) order type."""
-        order_type = "FAK"
-        
-        assert order_type.upper() == "FAK"
-    
-    def test_gtc_order_type(self):
-        """Test GTC (Good Till Cancel) order type."""
-        order_type = "GTC"
-        
-        assert order_type.upper() == "GTC"
+# ---------------------------------------------------------------------------
+# extract_order_id  (pure — no mocking needed)
+# ---------------------------------------------------------------------------
 
 
-class TestOrderValidation:
-    """Tests for order validation."""
-    
-    def test_price_must_be_positive(self):
-        """Test that price must be positive."""
-        price = 0.495
-        is_valid = price > 0
-        
-        assert is_valid is True
-    
-    def test_price_zero_invalid(self):
-        """Test that price of 0 is invalid."""
-        price = 0
-        is_valid = price > 0
-        
-        assert is_valid is False
-    
-    def test_price_negative_invalid(self):
-        """Test that negative price is invalid."""
-        price = -0.01
-        is_valid = price > 0
-        
-        assert is_valid is False
-    
-    def test_size_must_be_positive(self):
-        """Test that size must be positive."""
-        size = 5
-        is_valid = size > 0
-        
-        assert is_valid is True
-    
-    def test_size_zero_invalid(self):
-        """Test that size of 0 is invalid."""
-        size = 0
-        is_valid = size > 0
-        
-        assert is_valid is False
-    
-    def test_token_id_required(self):
-        """Test that token_id is required."""
-        token_id = "1234567890"
-        is_valid = bool(token_id and len(token_id) > 0)
-        
-        assert is_valid is True
-    
-    def test_token_id_empty_invalid(self):
-        """Test that empty token_id is invalid."""
-        token_id = ""
-        is_valid = bool(token_id and len(token_id) > 0)
-        
-        assert is_valid is False
+class TestExtractOrderId:
+    def test_flat_orderID(self):
+        assert extract_order_id({"orderID": "abc"}) == "abc"
+
+    def test_flat_orderId(self):
+        assert extract_order_id({"orderId": "abc"}) == "abc"
+
+    def test_nested_in_order(self):
+        assert extract_order_id({"order": {"orderID": "abc"}}) == "abc"
+
+    def test_nested_in_data(self):
+        assert extract_order_id({"data": {"orderId": "abc"}}) == "abc"
+
+    def test_returns_none_for_empty(self):
+        assert extract_order_id({}) is None
+
+    def test_returns_none_for_non_dict(self):
+        assert extract_order_id("string") is None
+
+    def test_returns_none_for_none(self):
+        assert extract_order_id(None) is None
 
 
-class TestSideValidation:
-    """Tests for order side validation."""
-    
-    def test_buy_side_valid(self):
-        """Test that BUY is a valid side."""
-        side = "BUY"
-        is_valid = side.upper() in {"BUY", "SELL"}
-        
-        assert is_valid is True
-    
-    def test_sell_side_valid(self):
-        """Test that SELL is a valid side."""
-        side = "SELL"
-        is_valid = side.upper() in {"BUY", "SELL"}
-        
-        assert is_valid is True
-    
-    def test_invalid_side_rejected(self):
-        """Test that invalid sides are rejected."""
-        side = "HOLD"
-        is_valid = side.upper() in {"BUY", "SELL"}
-        
-        assert is_valid is False
+# ---------------------------------------------------------------------------
+# summarize_order_state  (pure — no mocking needed)
+# ---------------------------------------------------------------------------
 
 
-class TestOrderCostCalculation:
-    """Tests for order cost calculation."""
-    
-    def test_simple_order_cost(self):
-        """Test calculating cost of a single order."""
-        price = 0.50
-        size = 10
-        cost = price * size
-        
-        assert cost == 5.00
-    
-    def test_arbitrage_order_cost(self):
-        """Test calculating cost of arbitrage (2 orders)."""
-        price_up = 0.495
-        price_down = 0.495
-        size = 5
-        
-        cost_up = price_up * size
-        cost_down = price_down * size
-        total_cost = cost_up + cost_down
-        
-        assert cost_up == 2.475
-        assert cost_down == 2.475
-        assert total_cost == 4.95
-    
-    def test_profit_calculation(self):
-        """Test profit calculation for arbitrage."""
-        total_cost = 4.95  # Paid $4.95 for $10 worth
-        payout = 10.00  # Will receive $10 when market resolves
-        profit = payout - total_cost
-        
-        assert profit == 5.05
-    
-    def test_profit_percentage(self):
-        """Test profit percentage calculation."""
-        total_cost = 4.95
-        profit = 5.05
-        profit_pct = (profit / total_cost) * 100
-        
-        assert profit_pct == pytest.approx(102.02, rel=0.01)
+class TestSummarizeOrderState:
+    def test_filled_order(self):
+        result = summarize_order_state({"status": "filled", "filled_size": "10"})
+        assert result["status"] == "filled"
+        assert result["filled_size"] == 10.0
+
+    def test_status_from_state_key(self):
+        result = summarize_order_state({"state": "canceled"})
+        assert result["status"] == "canceled"
+
+    def test_filled_computed_from_remaining(self):
+        result = summarize_order_state({"original_size": "10", "remaining_size": "3"})
+        assert result["filled_size"] == 7.0
+
+    def test_non_dict_input(self):
+        result = summarize_order_state("not-a-dict")
+        assert result["status"] is None
+        assert result["raw"] == "not-a-dict"
+
+    def test_requested_size_passthrough(self):
+        result = summarize_order_state({"status": "filled"}, requested_size=50)
+        assert result["requested_size"] == 50
 
 
-class TestBalanceCheck:
-    """Tests for balance checking logic."""
-    
-    def test_balance_sufficient(self):
-        """Test balance check when sufficient."""
-        balance = 100.0
-        required = 50.0
-        
-        can_trade = balance >= required
-        assert can_trade is True
-    
-    def test_balance_exactly_required(self):
-        """Test balance check when balance equals required."""
-        balance = 50.0
-        required = 50.0
-        
-        can_trade = balance >= required
-        assert can_trade is True
-    
-    def test_balance_insufficient(self):
-        """Test balance check when insufficient."""
-        balance = 40.0
-        required = 50.0
-        
-        can_trade = balance >= required
-        assert can_trade is False
-    
-    def test_balance_with_slack(self):
-        """Test balance check with slack (reserve)."""
-        balance = 100.0
-        required = 50.0
-        slack = 0.1  # 10% reserve
-        
-        required_with_slack = required * (1 + slack)  # 55.0
-        can_trade = balance >= required_with_slack
-        
-        # With $100 balance and $55 required (with slack), should pass
-        assert can_trade is True
+# ---------------------------------------------------------------------------
+# get_balance  (uses patch_trading fixture)
+# ---------------------------------------------------------------------------
 
 
-class TestRateLimitCheck:
-    """Tests for rate limit checking."""
-    
-    def test_rate_limit_under_max(self):
-        """Test rate limit check when under max."""
-        max_requests = 80
-        current_requests = 50
-        
-        can_proceed = current_requests < max_requests
-        assert can_proceed is True
-    
-    def test_rate_limit_at_max(self):
-        """Test rate limit check when at max."""
-        max_requests = 80
-        current_requests = 80
-        
-        can_proceed = current_requests < max_requests
-        assert can_proceed is False
-    
-    def test_rate_limit_window_reset(self):
-        """Test rate limit window reset logic."""
-        window_size = 60.0
-        now = time.time()
-        
-        # Old window
-        old_t0 = now - 100
-        should_reset = now - old_t0 > window_size
-        
-        assert should_reset is True
-        
-        # Recent window
-        recent_t0 = now - 30
-        should_reset = now - recent_t0 > window_size
-        
-        assert should_reset is False
+class TestGetBalance:
+    def test_normal_balance(self, patch_trading, make_settings):
+        patch_trading.get_balance_allowance.return_value = {"balance": "50000000"}
+        settings = make_settings()
+        assert get_balance(settings) == 50.0
+
+    def test_zero_balance(self, patch_trading, make_settings):
+        patch_trading.get_balance_allowance.return_value = {"balance": "0"}
+        settings = make_settings()
+        assert get_balance(settings) == 0.0
+
+    def test_non_dict_response(self, patch_trading, make_settings):
+        patch_trading.get_balance_allowance.return_value = "unexpected"
+        settings = make_settings()
+        assert get_balance(settings) == 0.0
+
+    def test_exception_returns_zero(self, patch_trading, make_settings):
+        patch_trading.get_balance_allowance.side_effect = RuntimeError("boom")
+        settings = make_settings()
+        assert get_balance(settings) == 0.0
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# ---------------------------------------------------------------------------
+# place_order  (uses patch_trading fixture)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceOrder:
+    def test_success(self, patch_trading, make_settings):
+        patch_trading.create_order.return_value = MagicMock(name="signed_order")
+        patch_trading.post_order.return_value = {"orderID": "order-1"}
+        settings = make_settings()
+        result = place_order(
+            settings, side="BUY", token_id="tok123", price=0.50, size=10
+        )
+        assert result == {"orderID": "order-1"}
+        patch_trading.create_order.assert_called_once()
+        patch_trading.post_order.assert_called_once()
+
+    def test_price_zero_raises(self, patch_trading, make_settings):
+        with pytest.raises(ValueError, match="price"):
+            place_order(make_settings(), side="BUY", token_id="tok", price=0, size=10)
+
+    def test_size_zero_raises(self, patch_trading, make_settings):
+        with pytest.raises(ValueError, match="size"):
+            place_order(make_settings(), side="BUY", token_id="tok", price=0.5, size=0)
+
+    def test_empty_token_raises(self, patch_trading, make_settings):
+        with pytest.raises(ValueError, match="token_id"):
+            place_order(make_settings(), side="BUY", token_id="", price=0.5, size=10)
+
+    def test_invalid_side_raises(self, patch_trading, make_settings):
+        with pytest.raises(ValueError, match="side"):
+            place_order(
+                make_settings(), side="HOLD", token_id="tok", price=0.5, size=10
+            )
+
+    def test_rate_limited(self, make_settings, mock_clob_client):
+        import src.trading as trading_mod
+
+        trading_mod._cached_client = None
+        mock_rl = MagicMock()
+        mock_rl.check_and_increment.return_value = False
+        with (
+            patch("src.trading.get_client", return_value=mock_clob_client),
+            patch("src.trading.get_rate_limiter", return_value=mock_rl),
+        ):
+            with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+                place_order(
+                    make_settings(), side="BUY", token_id="tok", price=0.5, size=10
+                )
+        trading_mod._cached_client = None
+
+
+# ---------------------------------------------------------------------------
+# place_orders_fast  (uses patch_trading fixture)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceOrdersFast:
+    def _make_orders(self):
+        return [
+            {"side": "BUY", "token_id": "tok_up", "price": 0.48, "size": 10},
+            {"side": "BUY", "token_id": "tok_down", "price": 0.48, "size": 10},
+        ]
+
+    def test_batch_success(self, patch_trading, make_settings):
+        patch_trading.create_order.return_value = MagicMock()
+        patch_trading.post_orders.return_value = [
+            {"orderID": "o1"},
+            {"orderID": "o2"},
+        ]
+        results = place_orders_fast(make_settings(), self._make_orders())
+        assert len(results) == 2
+        patch_trading.post_orders.assert_called_once()
+
+    def test_batch_fails_falls_back_to_sequential(self, patch_trading, make_settings):
+        patch_trading.create_order.return_value = MagicMock()
+        patch_trading.post_orders.side_effect = RuntimeError("batch fail")
+        patch_trading.post_order.return_value = {"orderID": "seq"}
+        results = place_orders_fast(make_settings(), self._make_orders())
+        assert len(results) == 2
+        assert patch_trading.post_order.call_count == 2
+
+    def test_rate_limited(self, make_settings, mock_clob_client):
+        import src.trading as trading_mod
+
+        trading_mod._cached_client = None
+        mock_rl = MagicMock()
+        mock_rl.check_and_increment.return_value = False
+        with (
+            patch("src.trading.get_client", return_value=mock_clob_client),
+            patch("src.trading.get_rate_limiter", return_value=mock_rl),
+        ):
+            with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+                place_orders_fast(make_settings(), self._make_orders())
+        trading_mod._cached_client = None
+
+
+# ---------------------------------------------------------------------------
+# wait_for_terminal_order  (patches get_order)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForTerminalOrder:
+    def test_immediately_filled(self, make_settings):
+        settings = make_settings()
+        with patch(
+            "src.trading.get_order",
+            return_value={"status": "filled", "filled_size": "10"},
+        ):
+            result = wait_for_terminal_order(
+                settings, "order-1", requested_size=10, timeout_seconds=1
+            )
+        assert result["terminal"] is True
+        assert result["filled"] is True
+
+    def test_timeout(self, make_settings):
+        settings = make_settings()
+        with patch(
+            "src.trading.get_order",
+            return_value={"status": "live", "filled_size": "0"},
+        ):
+            result = wait_for_terminal_order(
+                settings,
+                "order-1",
+                requested_size=10,
+                timeout_seconds=0.3,
+                poll_interval_seconds=0.1,
+            )
+        assert result["terminal"] is False
+
+    def test_canceled_is_terminal(self, make_settings):
+        settings = make_settings()
+        with patch(
+            "src.trading.get_order",
+            return_value={"status": "canceled"},
+        ):
+            result = wait_for_terminal_order(
+                settings, "order-1", timeout_seconds=1
+            )
+        assert result["terminal"] is True
+        assert result["filled"] is False
