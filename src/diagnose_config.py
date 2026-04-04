@@ -19,7 +19,7 @@ def main():
 
     # 1. Check environment variables
     private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-    signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+    signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
     funder = os.getenv("POLYMARKET_FUNDER", "")
     api_key = os.getenv("POLYMARKET_API_KEY", "")
 
@@ -71,7 +71,8 @@ def main():
                 print()
 
         # 4. Get balance through API
-        print("4. Checking USDC balance via Polymarket API...")
+        print("4. Checking USDC balance via Polymarket CLOB API...")
+        clob_balance_usdc = None
         try:
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
@@ -83,11 +84,60 @@ def main():
                 signature_type=signature_type,
             )
             result = client.get_balance_allowance(params)
+            print(f"   Raw API response: {result}")
             balance_raw = result.get("balance", "0") if isinstance(result, dict) else "0"
-            balance_usdc = float(balance_raw) / 1_000_000
-            print(f"   💰 Polymarket API Balance: ${balance_usdc:.6f}")
+            clob_balance_usdc = float(balance_raw) / 1_000_000
+            print(f"   💰 Polymarket CLOB Balance: ${clob_balance_usdc:.6f}")
         except Exception as e:
             print(f"   ❌ Error getting balance: {e}")
+            import traceback
+            traceback.print_exc()
+        print()
+
+        # 4b. Check on-chain USDC balances via Polygon JSON-RPC (no API key needed)
+        print("4b. Checking on-chain USDC balances (Polygon JSON-RPC)...")
+        import httpx
+
+        # USDC contracts on Polygon
+        usdc_contracts = {
+            "USDC (native)": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+            "USDC.e (bridged)": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        }
+        # balanceOf(address) selector = 0x70a08231
+        addresses_to_check = {"Signer": signer_address}
+        if funder and funder.lower() != signer_address.lower():
+            addresses_to_check["Funder (proxy)"] = funder
+
+        onchain_total = 0.0
+        for addr_label, addr in addresses_to_check.items():
+            for token_label, contract_addr in usdc_contracts.items():
+                try:
+                    # Encode balanceOf(address) call
+                    addr_padded = addr.lower().replace("0x", "").zfill(64)
+                    call_data = "0x70a08231" + addr_padded
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_call",
+                        "params": [
+                            {"to": contract_addr, "data": call_data},
+                            "latest",
+                        ],
+                    }
+                    resp = httpx.post(
+                        "https://polygon-bor-rpc.publicnode.com",
+                        json=payload,
+                        timeout=10,
+                    )
+                    rpc_result = resp.json().get("result", "0x0")
+                    balance_wei = int(rpc_result, 16)
+                    balance_usd = balance_wei / 1_000_000
+                    onchain_total += balance_usd
+                    marker = "💰" if balance_usd > 0 else "  "
+                    print(f"   {marker} {addr_label} / {token_label}: ${balance_usd:.6f}  ({addr[:10]}...)")
+                except Exception as e:
+                    print(f"   ❌ {addr_label} / {token_label}: error - {e}")
+        print(f"   Total on-chain USDC: ${onchain_total:.6f}")
         print()
 
         # 5. Try to check neg_risk detection for a sample token
@@ -140,13 +190,30 @@ def main():
                 "not your signer address"
             )
 
+        # Balance diagnosis
+        if onchain_total > 0 and (clob_balance_usdc is None or clob_balance_usdc < 0.01):
+            issues.append(
+                f"Found ${onchain_total:.2f} USDC on-chain but $0 in CLOB. "
+                "Funds may need to be deposited into Polymarket via the UI, "
+                "or your CLOB credentials may point to a different account."
+            )
+        elif onchain_total < 0.01 and (clob_balance_usdc is None or clob_balance_usdc < 0.01):
+            issues.append(
+                "No USDC found on-chain or in CLOB. Either funds are in a "
+                "different wallet, or you need to bridge USDC to Polygon and "
+                "deposit into Polymarket."
+            )
+
         if issues:
             print("❌ Issues found:")
             for issue in issues:
                 print(f"   - {issue}")
             print()
-            print("The 'invalid signature' error is likely caused by incorrect")
-            print("POLYMARKET_FUNDER configuration.")
+            print("Common fixes:")
+            print("  1. Regenerate API credentials: python -m src.generate_api_key")
+            print("  2. Verify POLYMARKET_FUNDER is your Polymarket proxy wallet address")
+            print("  3. Deposit funds via Polymarket UI if they are only on-chain")
+            print("  4. Check that your account has trading enabled on Polymarket")
         else:
             print("✓ No obvious configuration issues detected.")
             print()

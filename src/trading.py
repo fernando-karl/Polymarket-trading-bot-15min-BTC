@@ -67,18 +67,24 @@ def get_balance(settings: Settings) -> float:
             signature_type=settings.signature_type
         )
         result = client.get_balance_allowance(params)
-        
+        logger.debug(f"get_balance_allowance raw response: {result}")
+
         if isinstance(result, dict):
             balance_raw = result.get("balance", "0")
             balance_wei = float(balance_raw)
             # USDC has 6 decimals
             balance_usdc = balance_wei / 1_000_000
+            if balance_usdc == 0.0:
+                logger.warning(
+                    "CLOB returned balance=$0.00 — this may be genuine or a credentials issue. "
+                    f"Raw response: {result}"
+                )
             return balance_usdc
-        
-        logger.warning(f"Unexpected response when getting balance: {result}")
+
+        logger.error(f"Unexpected (non-dict) balance response: {result}")
         return 0.0
     except Exception as e:
-        logger.error(f"Error getting balance: {e}")
+        logger.error(f"Balance API call FAILED (returning 0.0 as fallback): {e}")
         return 0.0
 
 

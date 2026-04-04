@@ -14,7 +14,7 @@ class Settings:
     api_secret: str = os.getenv("POLYMARKET_API_SECRET", "")
     api_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     private_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-    signature_type: int = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
+    signature_type: int = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
     funder: str = os.getenv("POLYMARKET_FUNDER", "")
     market_slug: str = os.getenv("POLYMARKET_MARKET_SLUG", "")
     market_id: str = os.getenv("POLYMARKET_MARKET_ID", "")
