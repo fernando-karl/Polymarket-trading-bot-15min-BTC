@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import sys
+import traceback
 from pathlib import Path
 
 # Add parent to path for imports
@@ -35,7 +36,16 @@ class MultiMarketBot:
     
     async def start(self):
         """Start all market bots in parallel."""
+        import signal, traceback
         logger.info(f"🚀 Starting Multi-Market Bot for: {', '.join(self.market_slugs)}")
+        logger.info(f"PID: {os.getpid()} | Started at: {__import__('datetime').datetime.now().isoformat()}")
+        
+        # Catch signals for logging
+        def log_signal(signum, frame):
+            logger.warning(f"⚠️ Signal {signum} received — traceback: {''.join(traceback.format_stack(frame))}")
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try: signal.signal(s, log_signal)
+            except: pass
         
         # Create bot for each market
         for slug in self.market_slugs:
@@ -66,13 +76,22 @@ class MultiMarketBot:
     
     async def _run_bot(self, slug: str, bot):
         """Run a single bot with error recovery."""
+        import traceback
+        logger.info(f"🔵 Bot {slug} task started (PID {os.getpid()})")
         while True:
             try:
                 await bot.monitor_wss()
-            except Exception as e:
-                logger.error(f"Bot {slug} error: {e}")
+            except asyncio.CancelledError:
+                logger.info(f"🛑 Bot {slug} cancelled — exiting gracefully")
+                raise
+            except KeyboardInterrupt:
+                logger.info(f"🛑 Bot {slug} interrupted — exiting")
+                raise
+            except BaseException as e:
+                logger.error(f"🚨 Bot {slug} CRASHED ({type(e).__name__}): {e}")
+                logger.error(f"   Traceback: {traceback.format_exc()}")
+                logger.info(f"Restarting {slug} bot in 5s...")
                 await asyncio.sleep(5)
-                logger.info(f"Restarting {slug} bot...")
     
     async def _refresh_markets_loop(self):
         """Periodically check if markets need to be refreshed."""

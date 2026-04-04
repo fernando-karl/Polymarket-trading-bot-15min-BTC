@@ -7,6 +7,7 @@ to guarantee profits regardless of the outcome.
 
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -1280,6 +1281,17 @@ class SimpleArbitrageBot:
 
     async def monitor_wss(self):
         """Monitor using Polymarket CLOB Market WebSocket instead of polling."""
+        import traceback
+        import signal
+        logger.info(f"📡 monitor_wss() STARTING — market={self.market_slug} — PID={os.getpid()}")
+        
+        # Log signals
+        def _sig_handler(signum, frame):
+            logger.warning(f"⚠️ Signal {signum} in monitor_wss — exiting")
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try: signal.signal(s, _sig_handler)
+            except: pass
+        
         # Iniciar background tasks (balance refresh)
         await self._start_background_tasks()
         
@@ -1403,12 +1415,18 @@ class SimpleArbitrageBot:
                     else:
                         if self.settings.verbose:
                             logger.info("WSS eval skipped: book not ready")
-            except (KeyboardInterrupt, asyncio.CancelledError):
+            except asyncio.CancelledError:
+                logger.info("🛑 monitor_wss cancelled")
                 raise
-            except Exception as e:
-                logger.warning(f"WSS monitor loop error, reconnecting: {e}")
+            except KeyboardInterrupt:
+                logger.info("🛑 monitor_wss interrupted")
+                raise
+            except BaseException as e:
+                logger.error(f"🚨 WSS FATAL ({type(e).__name__}): {e}")
+                logger.error(f"   Traceback: {traceback.format_exc()}")
                 await asyncio.sleep(1.0)
                 continue
+        logger.warning("⚠️ WSS async for loop EXITED — will restart")
 
 
 async def main():
