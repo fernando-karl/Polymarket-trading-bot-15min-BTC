@@ -6,6 +6,9 @@ Provides rich console output with colors, progress indicators, and better format
 
 import logging
 import sys
+import os
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 # Try to import rich for better console output, fallback to basic logging
@@ -31,7 +34,7 @@ except ImportError:
 
 def setup_logging(verbose: bool = False, use_rich: bool = True) -> logging.Logger:
     """
-    Set up logging with optional rich formatting.
+    Set up logging with optional rich formatting + rotating file handler.
     
     Args:
         verbose: Enable verbose (DEBUG) logging
@@ -42,28 +45,47 @@ def setup_logging(verbose: bool = False, use_rich: bool = True) -> logging.Logge
     """
     level = logging.DEBUG if verbose else logging.INFO
     
+    # Determine log directory (parent of src/, i.e. project root)
+    log_dir = Path(__file__).parent.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "bot.log"
+    
+    # Rotating file handler: 50MB per file, keep 5 backups (~250MB total)
+    rotating_handler = RotatingFileHandler(
+        filename=str(log_path),
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    rotating_handler.setLevel(logging.DEBUG)
+    rotating_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    
     if use_rich and RICH_AVAILABLE:
         console = Console(stderr=True)
-        handler = RichHandler(
+        rich_handler = RichHandler(
             console=console,
             show_time=True,
             show_path=False,
             rich_tracebacks=True,
             markup=True,
         )
-        handler.setLevel(level)
+        rich_handler.setLevel(level)
         
         logging.basicConfig(
             level=level,
             format="%(message)s",
             datefmt="[%X]",
-            handlers=[handler],
+            handlers=[rich_handler, rotating_handler],
         )
     else:
         logging.basicConfig(
             level=level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[rotating_handler],
         )
     
     # Suppress noisy HTTP logs
